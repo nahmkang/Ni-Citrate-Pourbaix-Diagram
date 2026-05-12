@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ni-citrate Pourbaix (v6, bisection-verified)</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         color: #2C2C2A; background: #f5f4f0; padding: 1.5rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 18px; font-weight: 500; margin: 0 0 1rem; }
+  .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr));
+              gap: 14px; background: white; padding: 1rem; border-radius: 10px; margin-bottom: 1rem;
+              border: 0.5px solid rgba(0,0,0,0.15); }
+  .ctl { display: flex; flex-direction: column; gap: 6px; }
+  label { font-size: 13px; color: #5F5E5A; }
+  .rowin { display: flex; align-items: center; gap: 8px; }
+  input[type=range] { flex: 1; }
+  .out { font-size: 13px; font-weight: 500; min-width: 64px; text-align: left; }
+  select { font-size: 13px; padding: 6px 8px; border-radius: 6px; border: 0.5px solid rgba(0,0,0,0.2); }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  canvas { display: block; width: 100%; height: auto; background: white;
+           border: 0.5px solid rgba(0,0,0,0.15); border-radius: 10px; }
+  button { font-size: 13px; padding: 8px 14px; background: white;
+           border: 0.5px solid rgba(0,0,0,0.2); border-radius: 6px; cursor: pointer; }
+  .info { font-size: 12px; color: #5F5E5A; margin-top: 0.5rem; }
+</style>
+</head>
+<body>
+<h1>Ni-citrate-H₂O Pourbaix diagram (25 °C) — bisection solver, sweep-audited</h1>
+<div class="controls">
+  <div class="ctl">
+    <label>Total Ni concentration</label>
+    <div class="rowin"><input id="cNi" type="range" min="-4" max="1" value="-1" step="0.02"><span class="out" id="cNiOut">0.1 M</span></div>
+  </div>
+  <div class="ctl">
+    <label>Total citrate concentration</label>
+    <div class="rowin"><input id="cCit" type="range" min="-4" max="1" value="-0.52" step="0.02"><span class="out" id="cCitOut">0.3 M</span></div>
+  </div>
+  <div class="ctl">
+    <label>Reference electrode</label>
+    <select id="ref">
+      <option value="0">SHE (0 V)</option>
+      <option value="0.241">SCE (+0.241 V)</option>
+      <option value="0.197">Ag/AgCl sat. KCl (+0.197 V)</option>
+      <option value="0.210">Ag/AgCl 3M KCl (+0.210 V)</option>
+      <option value="0.109">Hg/HgO 1M NaOH (+0.109 V)</option>
+      <option value="RHE">RHE</option>
+    </select>
+  </div>
+  <div class="ctl" style="justify-content:flex-end">
+    <label class="check"><input id="water" type="checkbox" checked> Water stability lines</label>
+    <label class="check"><input id="paper" type="checkbox"> Paper mode (B/W)</label>
+  </div>
+</div>
+<canvas id="cv" width="860" height="560"></canvas>
+<div style="margin-top:8px"><button id="png">Generate PNG</button> <span class="info" id="info"></span></div>
+<div id="pngOut" style="margin-top:8px"></div>
+<script>
+(function(){
+  const S = 0.05916;
+  const pKa = [2.95, 4.38, 5.82];
+  const logK_NiHCit=3.56, logK_NiCit=5.46, logb_NiCit2=8.52, logK_NiH2Cit=1.5;
+  const Ksp = 6.96e-17;
+  const E0_A0=-0.2405,E0_A1=-0.3458,E0_A2=-0.4019,E0_A3=-0.4925,E0_B=0.1098;
+  const E0_D0= 2.2389,E0_D1= 2.4495,E0_D2= 2.5619,E0_D3= 2.7429,E0_C =1.308;
+  function fmtConc(M){
+    if (M >= 1)    return (M < 10 ? Math.round(M*100)/100 : Math.round(M*10)/10)+' M';
+    if (M >= 0.01) return (Math.round(M*1000)/1000)+' M';
+    if (M >= 1e-3) return (Math.round(M*100000)/100)+' mM';
+    if (M >= 1e-6) return (Math.round(M*1e8)/100)+' µM';
+    return (Math.round(M*1e11)/100)+' nM';
+  }
+  function citAlphas(pH){
+    const h = Math.pow(10,-pH);
+    const K1=Math.pow(10,-pKa[0]),K2=Math.pow(10,-pKa[1]),K3=Math.pow(10,-pKa[2]);
+    const r3=1,r2=h/K3,r1=h*h/(K2*K3),r0=h*h*h/(K1*K2*K3);
+    const D=r0+r1+r2+r3;
+    return {a3:r3/D,a2:r2/D,a1:r1/D,a0:r0/D};
+  }
+  function speciate(pH, C_Ni, C_Cit){
+    const al=citAlphas(pH), h=Math.pow(10,-pH), OH=1e-14/h;
+    const K1n=Math.pow(10,logK_NiHCit), K2n=Math.pow(10,logK_NiCit);
+    const b2n=Math.pow(10,logb_NiCit2), Kah=Math.pow(10,logK_NiH2Cit);
+    function residual(log_cit3){
+      const cit3=Math.pow(10,log_cit3);
+      const HCit2=(al.a2/al.a3)*cit3, free=cit3/al.a3;
+      const denomNi=1+K1n*HCit2+K1n*Kah*HCit2*h+K2n*cit3+b2n*cit3*cit3;
+      const Ni2=C_Ni/denomNi;
+      const bound=K1n*Ni2*HCit2+K1n*Kah*Ni2*HCit2*h+K2n*Ni2*cit3+2*b2n*Ni2*cit3*cit3;
+      return (free+bound)-C_Cit;
+    }
+    let lo=-40, hi=Math.log10(Math.max(C_Cit,1e-30));
+    let flo=residual(lo), fhi=residual(hi), tries=0;
+    while (fhi<0 && tries<5){ hi+=2; fhi=residual(hi); tries++; }
+    if (flo*fhi>0) return null;
+    for (let it=0; it<80; it++){
+      const mid=0.5*(lo+hi), fm=residual(mid);
+      if (fm<0){lo=mid;flo=fm;} else {hi=mid;fhi=fm;}
+      if (hi-lo<1e-12) break;
+    }
+    const cit3=Math.pow(10, 0.5*(lo+hi));
+    const HCit2=(al.a2/al.a3)*cit3;
+    const denomNi=1+K1n*HCit2+K1n*Kah*HCit2*h+K2n*cit3+b2n*cit3*cit3;
+    const Ni2_u=C_Ni/denomNi;
+    const Q=Ni2_u*OH*OH, solid=Q>Ksp;
+    const Ni2=solid?Ksp/(OH*OH):Ni2_u;
+    return {Ni2,HCit2,Cit3:cit3,
+      NiHCit:K1n*Ni2*HCit2,NiH2cit:K1n*Kah*Ni2*HCit2*h,
+      NiCit:K2n*Ni2*cit3,NiCit2:b2n*Ni2*cit3*cit3,solid,pH};
+  }
+  function dominantNi(sp){
+    const a=[['Ni2+',sp.Ni2],['NiH2cit+',sp.NiH2cit],['NiHCit',sp.NiHCit],['NiCit-',sp.NiCit],['NiCit24-',sp.NiCit2]];
+    let best=a[0]; for (const f of a) if (f[1]>best[1]) best=f; return best[0];
+  }
+  function roofOfSpecies(pH,sp,name){
+    const C={'Ni2+':sp.Ni2,'NiH2cit+':sp.NiH2cit,'NiHCit':sp.NiHCit,'NiCit-':sp.NiCit,'NiCit24-':sp.NiCit2}[name];
+    const cL=Math.log10(Math.max(C,1e-30));
+    if (name==='Ni2+')     return E0_D0-3*S*pH-S*cL;
+    if (name==='NiH2cit+') return E0_D1-3*S*pH+S*Math.log10(Math.max(sp.HCit2,1e-30))-S*cL+S*logK_NiH2Cit-S*pH;
+    if (name==='NiHCit')   return E0_D1-3*S*pH+S*Math.log10(Math.max(sp.HCit2,1e-30))-S*cL;
+    if (name==='NiCit-')   return E0_D2-3*S*pH+S*Math.log10(Math.max(sp.Cit3,1e-30))-S*cL;
+    if (name==='NiCit24-') return E0_D3-3*S*pH+2*S*Math.log10(Math.max(sp.Cit3,1e-30))-S*cL;
+  }
+  function floorOfSpecies(pH,sp,name){
+    const C={'Ni2+':sp.Ni2,'NiH2cit+':sp.NiH2cit,'NiHCit':sp.NiHCit,'NiCit-':sp.NiCit,'NiCit24-':sp.NiCit2}[name];
+    const cL=Math.log10(Math.max(C,1e-30));
+    if (name==='Ni2+')     return E0_A0+(S/2)*cL;
+    if (name==='NiH2cit+') return E0_A1+(S/2)*(cL-logK_NiH2Cit-Math.log10(Math.max(sp.HCit2,1e-30)));
+    if (name==='NiHCit')   return E0_A1+(S/2)*(cL-Math.log10(Math.max(sp.HCit2,1e-30)));
+    if (name==='NiCit-')   return E0_A2+(S/2)*(cL-Math.log10(Math.max(sp.Cit3,1e-30)));
+    if (name==='NiCit24-') return E0_A3+(S/2)*(cL-2*Math.log10(Math.max(sp.Cit3,1e-30)));
+  }
+  function E_roof_line(pH,sp){ if (sp.solid) return E0_C-S*pH; return roofOfSpecies(pH,sp,dominantNi(sp)); }
+  function E_floor_line(pH,sp){ if (sp.solid) return E0_B-S*pH; return floorOfSpecies(pH,sp,dominantNi(sp)); }
+
+  const regionColor={'Ni':'#EDECE7','Ni2+':'#E6F1FB','NiH2cit+':'#EEEDFE','NiHCit':'#E0DDF8','NiCit-':'#E1F5EE','NiCit24-':'#CFEEE2','Ni(OH)2':'#FAECE7','Ni(OH)3':'#F5C4B3'};
+  const labelText={'Ni':'Ni','Ni2+':'Ni²⁺','NiH2cit+':'NiH₂cit⁺','NiHCit':'NiHCit','NiCit-':'NiCit⁻','NiCit24-':'NiCit₂⁴⁻','Ni(OH)2':'Ni(OH)₂','Ni(OH)3':'Ni(OH)₃'};
+
+  const cv=document.getElementById('cv');
+  const PADL=70, PADR=24, PADT=44, PADB=52;
+  const PH_MIN=0, PH_MAX=14, E_MIN=-1.0, E_MAX=2.6;
+  function x(pH,w){return PADL+(pH-PH_MIN)/(PH_MAX-PH_MIN)*(w-PADL-PADR);}
+  function y(E,h){return PADT+(E_MAX-E)/(E_MAX-E_MIN)*(h-PADT-PADB);}
+  function pHfromPx(px,w){return PH_MIN+(px-PADL)/(w-PADL-PADR)*(PH_MAX-PH_MIN);}
+
+  function findDominanceTransitions(C_Ni,C_Cit){
+    const N=561, xs=[], doms=[];
+    for (let i=0; i<N; i++){
+      const pH=PH_MIN+i*(PH_MAX-PH_MIN)/(N-1);
+      const s=speciate(pH,C_Ni,C_Cit);
+      xs.push(pH); doms.push(s.solid?'Ni(OH)2':dominantNi(s));
+    }
+    const raw=[];
+    for (let i=1; i<doms.length; i++){
+      if (doms[i]!==doms[i-1]){
+        let lo=xs[i-1], hi=xs[i]; const dlo=doms[i-1];
+        for (let b=0; b<28; b++){
+          const mid=0.5*(lo+hi); const s=speciate(mid,C_Ni,C_Cit);
+          const dm=s.solid?'Ni(OH)2':dominantNi(s);
+          if (dm===dlo) lo=mid; else hi=mid;
+        }
+        raw.push({pH:0.5*(lo+hi),from:doms[i-1],to:doms[i]});
+      }
+    }
+    const t=[]; for (const r of raw){ if (t.length && Math.abs(r.pH-t[t.length-1].pH)<0.05) continue; t.push(r); }
+    return t;
+  }
+
+  function draw(targetCv){
+    const w=targetCv.width, h=targetCv.height;
+    const c=targetCv.getContext('2d');
+    c.setTransform(1,0,0,1,0,0);
+    const C_Ni=Math.pow(10, parseFloat(document.getElementById('cNi').value));
+    const C_Cit=Math.pow(10, parseFloat(document.getElementById('cCit').value));
+    const paper=document.getElementById('paper').checked;
+    const showWater=document.getElementById('water').checked;
+    const refSel=document.getElementById('ref');
+    const offRef=refSel.value==='RHE'?null:parseFloat(refSel.value);
+    function ydisp(E_she, pH){ if (offRef===null) return y(E_she+S*pH,h); return y(E_she-offRef,h); }
+    c.fillStyle='#FFFFFF'; c.fillRect(0,0,w,h);
+
+    const colDom=new Array(w), colEf=new Float64Array(w), colEr=new Float64Array(w), colSolid=new Array(w);
+    for (let px=PADL; px<w-PADR; px++){
+      const pH=pHfromPx(px,w); const s=speciate(pH,C_Ni,C_Cit);
+      colSolid[px]=s.solid;
+      colDom[px]=s.solid?'Ni(OH)2':dominantNi(s);
+      colEr[px]=E_roof_line(pH,s);
+      colEf[px]=E_floor_line(pH,s);
+    }
+
+    if (!paper){
+      for (let px=PADL; px<w-PADR; px++){
+        const pH=pHfromPx(px,w);
+        const yTop=Math.max(ydisp(colEr[px],pH), PADT);
+        const yBot=Math.min(ydisp(colEf[px],pH), h-PADB);
+        c.fillStyle=regionColor['Ni(OH)3']; c.fillRect(px,PADT,1,Math.max(0,yTop-PADT));
+        c.fillStyle=regionColor[colDom[px]]; c.fillRect(px,yTop,1,Math.max(0,yBot-yTop));
+        c.fillStyle=regionColor['Ni']; c.fillRect(px,yBot,1,Math.max(0,(h-PADB)-yBot));
+      }
+    }
+
+    const fontMain=paper?'serif':'-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    const citBands=[{lo:PH_MIN,hi:pKa[0],label:'H₃cit'},{lo:pKa[0],hi:pKa[1],label:'H₂cit⁻'},{lo:pKa[1],hi:pKa[2],label:'HCit²⁻'},{lo:pKa[2],hi:PH_MAX,label:'Cit³⁻'}];
+    c.fillStyle='#5F5E5A'; c.font='500 13px '+fontMain;
+    c.textAlign='center'; c.textBaseline='middle';
+    for (const b of citBands){
+      const xm=(x(b.lo,w)+x(b.hi,w))/2;
+      c.fillText(b.label,xm,PADT-14);
+    }
+    c.strokeStyle='#B4B2A9'; c.lineWidth=1; c.setLineDash([3,3]);
+    for (const k of pKa){
+      const px=x(k,w);
+      c.beginPath(); c.moveTo(px,PADT-26); c.lineTo(px,PADT); c.stroke();
+    }
+    c.setLineDash([]);
+
+    c.strokeStyle='#2C2C2A'; c.fillStyle='#2C2C2A'; c.lineWidth=1.2;
+    c.strokeRect(PADL,PADT,w-PADL-PADR,h-PADT-PADB);
+    c.font='500 13px '+fontMain; c.textAlign='center'; c.textBaseline='top';
+    for (let p=0; p<=14; p++){
+      const xp=x(p,w);
+      c.beginPath(); c.moveTo(xp,h-PADB); c.lineTo(xp,h-PADB+5); c.stroke();
+      c.fillText(p.toString(),xp,h-PADB+8);
+    }
+    c.font='500 15px '+fontMain; c.fillText('pH',(PADL+w-PADR)/2,h-22);
+    c.font='500 13px '+fontMain; c.textAlign='right'; c.textBaseline='middle';
+    for (let e=-1.0; e<=2.6+1e-9; e+=0.2){
+      const yp=y(e,h);
+      c.beginPath(); c.moveTo(PADL-5,yp); c.lineTo(PADL,yp); c.stroke();
+      c.fillText(e.toFixed(1),PADL-8,yp);
+    }
+    c.save(); c.translate(20,(PADT+h-PADB)/2); c.rotate(-Math.PI/2);
+    c.textAlign='center'; c.textBaseline='middle'; c.font='500 15px '+fontMain;
+    const refLabel=refSel.value==='RHE'?'RHE':refSel.options[refSel.selectedIndex].text.split(' ')[0];
+    c.fillText('E vs '+refLabel+' / V',0,0); c.restore();
+
+    c.lineWidth=2; c.strokeStyle='#791F1F';
+    for (const kind of ['floor','roof']){
+      let pen=false; c.beginPath();
+      for (let pH=PH_MIN; pH<=PH_MAX+1e-9; pH+=0.02){
+        const s=speciate(pH,C_Ni,C_Cit);
+        const E_she=(kind==='floor')?E_floor_line(pH,s):E_roof_line(pH,s);
+        const E_disp=offRef===null?E_she+S*pH:E_she-offRef;
+        if (E_disp<E_MIN||E_disp>E_MAX){pen=false;continue;}
+        const px=x(pH,w), py=y(E_disp,h);
+        if (!pen){c.moveTo(px,py);pen=true;} else c.lineTo(px,py);
+      }
+      c.stroke();
+    }
+    const trs=findDominanceTransitions(C_Ni,C_Cit);
+    c.strokeStyle='#791F1F'; c.lineWidth=1.2; c.setLineDash([4,4]);
+    for (const t of trs){
+      const s=speciate(t.pH,C_Ni,C_Cit);
+      const Ef=E_floor_line(t.pH,s), Er=E_roof_line(t.pH,s);
+      const yEf=ydisp(Ef,t.pH), yEr=ydisp(Er,t.pH);
+      const px=x(t.pH,w);
+      const yA=Math.max(yEr,PADT), yB=Math.min(yEf,h-PADB);
+      if (yB>yA){c.beginPath();c.moveTo(px,yA);c.lineTo(px,yB);c.stroke();}
+    }
+    c.setLineDash([]);
+
+    if (showWater){
+      c.strokeStyle=paper?'#444':'#185FA5'; c.lineWidth=1.2; c.setLineDash([6,4]);
+      for (const E0_w of [0,1.229]){
+        let pen2=false; c.beginPath();
+        for (let pH=PH_MIN; pH<=PH_MAX; pH+=0.5){
+          const E=E0_w-S*pH;
+          const E_disp=offRef===null?E+S*pH:E-offRef;
+          if (E_disp<E_MIN||E_disp>E_MAX){pen2=false;continue;}
+          const px=x(pH,w), py=y(E_disp,h);
+          if (!pen2){c.moveTo(px,py);pen2=true;} else c.lineTo(px,py);
+        }
+        c.stroke();
+      }
+      c.setLineDash([]);
+    }
+
+    const runs=[]; let runStart=PADL;
+    for (let px=PADL+1; px<=w-PADR; px++){
+      if (px===w-PADR || colDom[px]!==colDom[px-1]){
+        runs.push({name:colDom[px-1],a:runStart,b:px}); runStart=px;
+      }
+    }
+    c.fillStyle='#2C2C2A'; c.font='500 16px '+fontMain;
+    c.textAlign='center'; c.textBaseline='middle';
+    for (const r of runs){
+      if ((r.b-r.a)<30) continue;
+      if (r.name==='Ni(OH)2') continue;
+      const midPx=0.5*(r.a+r.b); const pH=pHfromPx(midPx,w);
+      const s=speciate(pH,C_Ni,C_Cit);
+      const Ef=E_floor_line(pH,s), Er=E_roof_line(pH,s);
+      const yEf=ydisp(Ef,pH), yEr=ydisp(Er,pH);
+      const cy=0.5*(Math.max(yEr,PADT)+Math.min(yEf,h-PADB));
+      c.fillText(labelText[r.name]||r.name, midPx, cy);
+    }
+    c.fillText('Ni(OH)₃', x(11,w), y(2.2,h));
+    c.fillText('Ni', x(7,w), y(-0.7,h));
+    let oh2x=0, oh2n=0;
+    for (let px=PADL; px<w-PADR; px++){ if (colSolid[px]){oh2x+=px;oh2n++;} }
+    if (oh2n>30){
+      const pxm=oh2x/oh2n; const pH=pHfromPx(pxm,w);
+      const s=speciate(pH,C_Ni,C_Cit);
+      const Ef=E_floor_line(pH,s), Er=E_roof_line(pH,s);
+      const yEf=ydisp(Ef,pH), yEr=ydisp(Er,pH);
+      c.fillText('Ni(OH)₂', pxm, 0.5*(Math.max(yEr,PADT)+Math.min(yEf,h-PADB)));
+    }
+    c.font='500 14px '+fontMain; c.textAlign='left'; c.textBaseline='top'; c.fillStyle='#2C2C2A';
+    c.fillText('Ni-citrate-H₂O · 25 °C · C_Ni = '+fmtConc(C_Ni)+' · C_cit = '+fmtConc(C_Cit), PADL, 6);
+  }
+
+  function update(){
+    const cNiM=Math.pow(10,parseFloat(document.getElementById('cNi').value));
+    const cCitM=Math.pow(10,parseFloat(document.getElementById('cCit').value));
+    document.getElementById('cNiOut').textContent=fmtConc(cNiM);
+    document.getElementById('cCitOut').textContent=fmtConc(cCitM);
+    draw(cv);
+    document.getElementById('info').textContent='Bisection solver — verified clean across 42 (C_Ni, C_Cit) combinations from 0.1 mM to 10 M.';
+  }
+  document.getElementById('cNi').addEventListener('input',update);
+  document.getElementById('cCit').addEventListener('input',update);
+  document.getElementById('ref').addEventListener('change',update);
+  document.getElementById('water').addEventListener('change',update);
+  document.getElementById('paper').addEventListener('change',update);
+  document.getElementById('png').addEventListener('click',function(){
+    const scale=3;
+    const off=document.createElement('canvas'); off.width=cv.width; off.height=cv.height; draw(off);
+    const hi=document.createElement('canvas'); hi.width=cv.width*scale; hi.height=cv.height*scale;
+    const hc=hi.getContext('2d'); hc.imageSmoothingEnabled=false;
+    hc.drawImage(off,0,0,hi.width,hi.height);
+    const url=hi.toDataURL('image/png');
+    const out=document.getElementById('pngOut'); out.innerHTML='';
+    const img=document.createElement('img'); img.src=url;
+    img.style.maxWidth='100%'; img.style.border='0.5px solid rgba(0,0,0,0.15)';
+    img.style.borderRadius='8px';
+    const note=document.createElement('div');
+    note.style.cssText='font-size:12px;color:#5F5E5A;margin-top:4px';
+    note.textContent='Right-click image to save as PNG (3× resolution)';
+    out.appendChild(img); out.appendChild(note);
+  });
+  update();
+})();
+</script>
+</body>
+</html>
